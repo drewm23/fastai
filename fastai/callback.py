@@ -16,8 +16,8 @@ class OptimWrapper():
         self.wd = wd
 
     @classmethod
-    def create(cls, opt_func:Union[type,Callable], lr:Union[float,Tuple,List],
-               layer_groups:ModuleList, wd:Floats=0., true_wd:bool=False, bn_wd:bool=True)->optim.Optimizer:
+    def create(cls, opt_func:Union[type,Callable], lr:Union[float,Tuple,List], layer_groups:ModuleList, wd:Floats=0., 
+               true_wd:bool=False, bn_wd:bool=True)->optim.Optimizer:
         "Create an `optim.Optimizer` from `opt_func` with `lr`. Set lr on `layer_groups`."
         split_params = split_no_wd_params(layer_groups)
         opt = opt_func([{'params': p, 'lr':0} for p in split_params])
@@ -25,12 +25,20 @@ class OptimWrapper():
         opt.lr,opt.opt_func = listify(lr, layer_groups),opt_func
         return opt
 
-    def new(self, layer_groups:Collection[nn.Module]):
+    def new(self, layer_groups:Collection[nn.Module], split_no_wd:bool=True):
         "Create a new `OptimWrapper` from `self` with another `layer_groups` but the same hyper-parameters."
         opt_func = getattr(self, 'opt_func', self.opt.__class__)
         res = self.create(opt_func, self.lr, layer_groups, wd=self.wd, true_wd=self.true_wd, bn_wd=self.bn_wd)
         res.mom,res.beta = self.mom,self.beta
         return res
+
+    def new_with_params(self, param_groups:Collection[Collection[nn.Parameter]]):
+        "Create a new `OptimWrapper` from `self` with another `layer_groups` but the same hyper-parameters."
+        opt_func = getattr(self, 'opt_func', self.opt.__class__)
+        opt = opt_func([{'params': p, 'lr':0} for p in param_groups])
+        opt = self.__class__(opt, wd=self.wd, true_wd=self.true_wd, bn_wd=self.bn_wd)
+        opt.lr,opt.opt_func,opt.mom,opt.beta = self.lr,opt_func,self.mom,self.beta
+        return opt
 
     def __repr__(self)->str:
         return f'OptimWrapper over {repr(self.opt)}.\nTrue weight decay: {self.true_wd}'
@@ -52,7 +60,7 @@ class OptimWrapper():
         self.opt.zero_grad()
 
     #Passthrough to the inner opt.
-    def __getattr__(self,k:str)->Any: return getattr(self.opt, k, None)
+    def __getattr__(self, k:str)->Any: return getattr(self.opt, k, None)
     def __setstate__(self,data:Any): self.__dict__.update(data)
 
     def clear(self):
@@ -60,6 +68,9 @@ class OptimWrapper():
         sd = self.state_dict()
         sd['state'] = {}
         self.load_state_dict(sd)
+
+    @property
+    def n_params(self): return sum([len(pg['params']) for pg in self.opt.param_groups])
 
     #Hyperparameters as properties
     @property
@@ -103,6 +114,19 @@ class OptimWrapper():
         if 'alpha' in self.opt_keys: self._beta = self.read_val('alpha')
         if 'betas' in self.opt_keys: self._mom,self._beta = self.read_val('betas')
         if 'weight_decay' in self.opt_keys: self._wd = self.read_val('weight_decay')
+        reserved_names = ['params', 'lr', 'momentum', 'alpha', 'betas', 'weight_decay']
+        stat_names = [n for n in self.opt_keys if n not in reserved_names]
+        self._stats = {n:self.read_val(n) for n in stat_names}
+
+    def get_stat(self, name:str)->float: 
+        if name in ['lr', 'mom', 'beta', 'wd']: return getattr(self, name)
+        else: return self._stats[name][-1]
+    def set_stat(self, name:str, value:Union[float, Collection[float]])->None:
+        if name in ['lr', 'mom', 'beta', 'wd']: setattr(self, name, value)
+        else:
+            val = listify(value, self._stats[name])
+            self.set_val(name, val)
+            self._stats[name] = val
 
     def set_val(self, key:str, val:Any, bn_groups:bool=True)->Any:
         "Set `val` inside the optimizer dictionary at `key`."
@@ -271,7 +295,7 @@ class CallbackHandler():
         "Handle end of gradient calculation."
         self('backward_end', call_mets=False)
         return self.state_dict['skip_step']
-        
+
     def on_step_end(self)->None:
         "Handle end of optimization step."
         self('step_end', call_mets=False)
@@ -288,7 +312,7 @@ class CallbackHandler():
 
     def on_epoch_end(self, val_loss:Tensor)->bool:
         "Epoch is done, process `val_loss`."
-        self.state_dict['last_metrics'] = [val_loss] if val_loss is not None else None
+        self.state_dict['last_metrics'] = [val_loss] if val_loss is not None else [None]
         self('epoch_end', call_mets = val_loss is not None)
         self.state_dict['epoch'] += 1
         return self.state_dict['stop_training']
@@ -353,6 +377,8 @@ class Scheduler():
         if func is None: self.func = annealing_linear if is_tuple(vals) else annealing_no
         else:          self.func = func
         self.n = 0
+        
+    def restart(self): self.n = 0
 
     def step(self)->Number:
         "Return next value along annealed schedule."
@@ -363,3 +389,4 @@ class Scheduler():
     def is_done(self)->bool:
         "Return `True` if schedule completed."
         return self.n >= self.n_iter
+

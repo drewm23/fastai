@@ -58,14 +58,19 @@ fastai_types = {
     OptSplitFunc:'OptSplitFunc', PixelFunc:'PixelFunc', LightingFunc:'LightingFunc', IntsOrStrs:'IntsOrStrs'
 }
 
-torch.set_num_threads(4) # OpenMP doesn't generally like too many threads
-
 bn_types = (nn.BatchNorm1d, nn.BatchNorm2d, nn.BatchNorm3d)
 bias_types = (nn.Linear, nn.Conv1d, nn.Conv2d, nn.Conv3d, nn.ConvTranspose1d, nn.ConvTranspose2d, nn.ConvTranspose3d)
 def is_pool_type(l:Callable): return re.search(r'Pool[123]d$', l.__class__.__name__)
 no_wd_types = bn_types + (nn.LayerNorm,)
 defaults.device = torch.device('cuda') if torch.cuda.is_available() else torch.device('cpu')
 AdamW = partial(optim.Adam, betas=(0.9,0.99))
+
+#Monkey-patch `torch.cuda.set_device` so that it updates `defaults.device`
+_old_torch_cuda_set_device = torch.cuda.set_device
+def _new_torch_cuda_set_device(device):
+    _old_torch_cuda_set_device(device)
+    defaults.device = torch.device('cuda', device) if isinstance(device, int) else device
+torch.cuda.set_device = _new_torch_cuda_set_device
 
 def tensor(x:Any, *rest)->Tensor:
     "Like `torch.as_tensor`, but handle lists too, and can pass multiple vector elements directly."
@@ -114,7 +119,7 @@ def to_device(b:Tensors, device:torch.device):
     device = ifnone(device, defaults.device)
     if is_listy(b): return [to_device(o, device) for o in b]
     if is_dict(b): return {k: to_device(v, device) for k, v in b.items()}
-    return b.to(device)
+    return b.to(device, non_blocking=True)
 
 def data_collate(batch:ItemsList)->Tensor:
     "Convert `batch` items to tensor data."
@@ -186,6 +191,9 @@ def split_model(model:nn.Module=None, splits:Collection[Union[nn.Module,ModuleLi
         return split_model_idx(model, idxs)
     return [nn.Sequential(*s) for s in splits]
 
+def get_param_groups(layer_groups:Collection[nn.Module])->List[List[nn.Parameter]]:
+    return [sum([list(trainable_params(c)) for c in l.children()], []) for l in layer_groups]
+
 def split_no_wd_params(layer_groups:Collection[nn.Module])->List[List[nn.Parameter]]:
     "Separate the parameters in `layer_groups` between `no_wd_types` and  bias (`bias_types`) from the rest."
     split_params = []
@@ -201,7 +209,7 @@ def split_no_wd_params(layer_groups:Collection[nn.Module])->List[List[nn.Paramet
         #Since we scan the children separately, we might get duplicates (tied weights). We need to preserve the order
         #for the optimizer load of state_dict
         l1,l2 = uniqueify(l1),uniqueify(l2)
-        split_params += [l1, l2]      
+        split_params += [l1, l2]
     return split_params
 
 def set_bn_eval(m:nn.Module)->None:
@@ -392,11 +400,11 @@ def rank_distrib():
 
 def add_metrics(last_metrics:Collection[Rank0Tensor], mets:Union[Rank0Tensor, Collection[Rank0Tensor]]):
     "Return a dictionary for updating `last_metrics` with `mets`."
-    mets = listify(mets)
+    last_metrics,mets = listify(last_metrics),listify(mets)
     return {'last_metrics': last_metrics + mets}
 
 def try_save(state:Dict, path:Path, fname:PathOrStr):
     try: torch.save(state, open(path/fname, 'wb'))
     except OSError as e:
-        raise Exception(f"{e}\n Can't write in {path/fname}. Pass a full libpath path that is writable as `fname`.") 
-    
+        raise Exception(f"{e}\n Can't write {path/fname}. Pass an absolute writable pathlib obj `fname`.")
+
